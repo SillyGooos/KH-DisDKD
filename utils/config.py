@@ -55,6 +55,8 @@ def parse_args():
                        help='Discriminator learning rate')
     parser.add_argument('--dkd_alpha', type=float, default=1.0, help='DKD TCKD weight')
     parser.add_argument('--dkd_beta', type=float, default=8.0, help='DKD NCKD weight')
+    parser.add_argument('--fitnet_stage1_epochs', type=int, default=0, 
+                       help='Number of epochs for FitNet Stage 1 (Hint only)')
     
     # Training hyperparameters
     parser.add_argument('--epochs', type=int, default=20)
