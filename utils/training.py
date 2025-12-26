@@ -161,7 +161,6 @@ class Trainer:
             self.loss_tracker.log_epoch(epoch, "train", train_losses, train_acc, lr=lr)
             self.loss_tracker.log_epoch(epoch, "val", val_losses, val_acc, lr=lr)
 
-
             self.student_scheduler.step()
 
             # --- MERGED LOGGING LOGIC ---
@@ -248,7 +247,7 @@ class Trainer:
                 self._update_progress_bar(progress_bar, meters)
 
         progress_bar.close()
-        return self._get_average_losses(meters)
+        return self._get_average_losses(meters), meters["accuracy"].avg
 
     def _train_epoch_adversarial(self, train_loader, epoch):
         """Train for one epoch (adversarial methods: DisDKD)."""
@@ -330,8 +329,7 @@ class Trainer:
                 self._update_adversarial_progress_bar(progress_bar, meters)
 
         progress_bar.close()
-        return self._get_average_losses(meters)
-
+        return self._get_average_losses(meters), meters["accuracy"].avg
 
     def _validate(self, val_loader, epoch=None):
         """Validate the model."""
@@ -645,4 +643,3 @@ class Trainer:
     def _get_average_losses(self, meters):
         """Return a dict of average losses/metrics (excluding accuracy)."""
         return {key: meter.avg for key, meter in meters.items() if key != "accuracy"}
-
