@@ -54,6 +54,9 @@ class ContrastiveLoss(nn.Module):
         self, n_data, feat_dim=128, temperature=0.07, momentum=0.5, n_negatives=4096
     ):
         super(ContrastiveLoss, self).__init__()
+        if n_data < 2:
+            raise ValueError(f"CRD requires n_data >= 2, got {n_data}")
+        
         self.n_data = n_data
         self.feat_dim = feat_dim
         self.temperature = temperature
@@ -95,22 +98,64 @@ class ContrastiveLoss(nn.Module):
         # =================================================================
         # NEGATIVE SAMPLES: from memory bank
         # =================================================================
-        # Sample negative indices (avoiding the current batch indices)
-        neg_indices = torch.randint(
-            0, self.n_data, (batch_size, self.n_negatives), device=student_feat.device
+        # We must never sample the positive index for each anchor.
+        # Optional: also avoid sampling any index that is in the current batch.
+
+        # indices: [B]
+        idx = indices.long().to(student_feat.device).view(-1)  # [B]
+
+        if idx.numel() != batch_size:
+            raise RuntimeError(f"indices length {idx.numel()} != batch_size {batch_size}")
+
+        B = idx.size(0)
+
+        # 1) Sample from [0, n_data-2] then shift to skip idx per row.
+        # This guarantees neg != idx for each sample without any while-loop.
+        r = torch.randint(
+            low=0,
+            high=self.n_data - 1,
+            size=(B, self.n_negatives),
+            device=student_feat.device,
         )
 
-        # Retrieve negative samples from memory bank
-        neg_feat = self.memory_bank[neg_indices]  # [batch_size, n_negatives, feat_dim]
+        # Shift values >= idx upward by 1 -> now in [0, n_data-1] but never equal to idx
+        neg_indices = r + (r >= idx.view(B, 1)).long()
 
-        # Compute similarities with negative samples
-        neg_logits = (
-            torch.bmm(
-                student_feat.unsqueeze(1),  # [batch_size, 1, feat_dim]
-                neg_feat.transpose(1, 2),  # [batch_size, feat_dim, n_negatives]
-            ).squeeze(1)
-            / self.temperature
-        )  # [batch_size, n_negatives]
+        # # 2) OPTIONAL: avoid sampling any index from the current batch (stronger)
+        # # This is slower but correct. If you want it, keep it.
+        # avoid_batch = True
+        # if avoid_batch:
+        #     forbidden = idx.unique()
+        #     # Resample only the forbidden positions until clean (bounded loop)
+        #     # Using the same "shift trick" but we need per-row skip again, so we do it per-mask.
+        #     for _ in range(10):  # 10 is plenty in practice
+        #         mask = torch.isin(neg_indices, forbidden)
+        #         if not mask.any():
+        #             break
+        #         # resample masked positions with the same trick
+        #         rr = torch.randint(
+        #             low=0,
+        #             high=self.n_data - 1,
+        #             size=(int(mask.sum().item()),),
+        #             device=student_feat.device,
+        #         )
+        #         # Need the row-wise idx for each masked element
+        #         row_ids = mask.nonzero(as_tuple=False)[:, 0]  # [K]
+        #         rr = rr + (rr >= idx[row_ids]).long()
+        #         neg_indices[mask] = rr
+        #     else:
+        #         # If we somehow cannot cleanly sample (extremely small datasets),
+        #         # fall back to only excluding the positive per-row.
+        #         pass
+            
+        # Retrieve negative samples from memory bank
+        neg_feat = self.memory_bank[neg_indices]  # [B, n_negatives, feat_dim]
+        neg_feat = F.normalize(neg_feat, dim=2)   # robust
+
+        # Compute similarity between student features and negative samples
+        neg_logits = torch.bmm(neg_feat, student_feat.unsqueeze(2)).squeeze(2) / self.temperature
+        # neg_logits: [B, n_negatives]
+
 
         # =================================================================
         # NCE LOSS COMPUTATION
@@ -136,9 +181,7 @@ class ContrastiveLoss(nn.Module):
 
                 # Ensure we have matching batch sizes
                 if idx.size(0) != teacher_feat.size(0):
-                    min_size = min(idx.size(0), teacher_feat.size(0))
-                    idx = idx[:min_size]
-                    teacher_feat = teacher_feat[:min_size]
+                    raise RuntimeError(f"CRD memory update mismatch: idx {idx.size(0)} vs teacher_feat {teacher_feat.size(0)}")
 
                 if idx.numel() > 0:
                     # Momentum update: new = momentum * old + (1 - momentum) * new
@@ -179,7 +222,7 @@ class CRD(nn.Module):
     def __init__(
         self,
         teacher,
-        student,
+        student, 
         teacher_layer,
         student_layer,
         teacher_channels,
@@ -274,17 +317,13 @@ class CRD(nn.Module):
         teacher_proj = self.teacher_projector(teacher_feat)
         student_proj = self.student_projector(student_feat)
 
-        # Compute contrastive loss
-        if self.sample_indices is not None:
-            crd_loss = self.contrastive_loss(
-                student_proj, teacher_proj, self.sample_indices
-            )
+        if self.sample_indices is None:
+            if self.training:
+                raise RuntimeError("CRD: sample_indices not set. Train loader must return (x,y,idx).")
+            # eval mode: do not compute CRD loss
+            crd_loss = torch.zeros([], device=student_proj.device)
         else:
-            # Fallback: create pseudo-indices if not provided
-            # NOTE: This is not ideal for CRD as memory bank won't be updated correctly
-            batch_size = x.size(0)
-            indices = torch.arange(batch_size, device=x.device) % self.n_data
-            crd_loss = self.contrastive_loss(student_proj, teacher_proj, indices)
+            crd_loss = self.contrastive_loss(student_proj, teacher_proj, self.sample_indices)
 
         # Clear features for next forward pass
         self.teacher_hooks.clear()

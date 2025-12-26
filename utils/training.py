@@ -81,114 +81,115 @@ class Trainer:
     #     """Main training loop."""
     #     print(f"\nStarting training for {self.args.epochs} epochs...")
     #     best_acc = 0.0
-        
+
     #     for epoch in range(self.args.epochs):
     #         start_time = time.time()
-            
+
     #         # Train and validate
     #         if self.args.method in ['DisDKD']:
     #             train_losses, train_acc = self._train_epoch_adversarial(train_loader, epoch)
     #         else:
     #             train_losses, train_acc = self._train_epoch_standard(train_loader, epoch)
-            
+
     #         val_losses, val_acc = self._validate(val_loader, epoch)
-            
+
     #         # Log losses
     #         self.loss_tracker.log_epoch(epoch, 'train', train_losses, train_acc)
     #         self.loss_tracker.log_epoch(epoch, 'val', val_losses, val_acc)
-            
+
     #         self.student_scheduler.step()
-            
+
     #         # Print epoch summary
     #         elapsed = time.time() - start_time
     #         print(f'Epoch {epoch}: Train {train_acc:.2f}%, Val {val_acc:.2f}%, Time {elapsed:.1f}s')
-            
+
     #         # Save best model
     #         if val_acc > best_acc:
     #             best_acc = val_acc
-    #             save_checkpoint(self.model, self.student_optimizer, epoch, val_acc, 
+    #             save_checkpoint(self.model, self.student_optimizer, epoch, val_acc,
     #                         self.args, is_best=True)
-            
+
     #         print('-' * 80)
-        
+
     #     return best_acc
 
     def train(self, train_loader, val_loader):
-            """Main training loop with FitNet 2-Stage Logic."""
-            print(f"\nStarting training for {self.args.epochs} epochs...")
-            best_acc = 0.0
-            
-            # --- FROM YOUR COMMIT: 2-STAGE LOGIC START ---
-            # Store original weights so we can restore them in Stage 2
-            original_alpha = self.args.alpha
-            original_beta = self.args.beta
-            original_gamma = self.args.gamma
+        """Main training loop with FitNet 2-Stage Logic."""
+        print(f"\nStarting training for {self.args.epochs} epochs...")
+        best_acc = 0.0
 
-            for epoch in range(self.args.epochs):
-                start_time = time.time()
-                
-                # --- FITNET STAGE SWITCHING LOGIC ---
-                if self.args.method == 'FitNet' and self.args.fitnet_stage1_epochs > 0:
-                    if epoch < self.args.fitnet_stage1_epochs:
-                        # STAGE 1: HINT ONLY
-                        self.args.alpha = 0.0
-                        self.args.beta = 0.0
-                        self.args.gamma = original_gamma
-                        stage_name = "Stage 1 (Hint Only)"
-                    else:
-                        # STAGE 2: DISTILLATION ONLY
-                        self.args.alpha = original_alpha
-                        self.args.beta = original_beta
-                        self.args.gamma = 0.0
-                        stage_name = "Stage 2 (Task)"
+        # --- FROM YOUR COMMIT: 2-STAGE LOGIC START ---
+        # Store original weights so we can restore them in Stage 2
+        original_alpha = self.args.alpha
+        original_beta = self.args.beta
+        original_gamma = self.args.gamma
+
+        for epoch in range(self.args.epochs):
+            start_time = time.time()
+
+            # --- FITNET STAGE SWITCHING LOGIC ---
+            if self.args.method == 'FitNet' and self.args.fitnet_stage1_epochs > 0:
+                if epoch < self.args.fitnet_stage1_epochs:
+                    # STAGE 1: HINT ONLY
+                    self.args.alpha = 0.0
+                    self.args.beta = 0.0
+                    self.args.gamma = original_gamma
+                    stage_name = "Stage 1 (Hint Only)"
                 else:
-                    stage_name = "Standard"
-                # ------------------------------------
+                    # STAGE 2: DISTILLATION ONLY
+                    self.args.alpha = original_alpha
+                    self.args.beta = original_beta
+                    self.args.gamma = 0.0
+                    stage_name = "Stage 2 (Task)"
+            else:
+                stage_name = "Standard"
+            # ------------------------------------
 
-                # Train and validate
-                if self.args.method in ["DisDKD"]:
-                    train_losses, train_acc = self._train_epoch_adversarial(
+            # Train and validate
+            if self.args.method in ["DisDKD"]:
+                train_losses, train_acc = self._train_epoch_adversarial(
                         train_loader, epoch
                     )
-                else:
-                    train_losses, train_acc = self._train_epoch_standard(
+            else:
+                train_losses, train_acc = self._train_epoch_standard(
                         train_loader, epoch
                     )
 
-                val_losses, val_acc = self._validate(val_loader, epoch)
+            val_losses, val_acc = self._validate(val_loader, epoch)
 
-                # Log losses
-                self.loss_tracker.log_epoch(epoch, "train", train_losses, train_acc)
-                self.loss_tracker.log_epoch(epoch, "val", val_losses, val_acc)
+            lr = self.student_optimizer.param_groups[0]["lr"]
+            self.loss_tracker.log_epoch(epoch, "train", train_losses, train_acc, lr=lr)
+            self.loss_tracker.log_epoch(epoch, "val", val_losses, val_acc, lr=lr)
 
-                self.student_scheduler.step()
 
-                # --- MERGED LOGGING LOGIC ---
-                elapsed = time.time() - start_time
+            self.student_scheduler.step()
 
-                if self.args.method == "DisDKD":
-                    # Use the advanced metrics (from your team's update)
-                    disc_acc = train_losses.get("disc_accuracy", 0) * 100
-                    fool_rate = train_losses.get("fool_rate", 0) * 100
-                    dkd_loss = train_losses.get("dkd", 0)
-                    disc_loss = train_losses.get("discriminator", 0)
-                    adv_loss = train_losses.get("adversarial", 0)
-                    print(
+            # --- MERGED LOGGING LOGIC ---
+            elapsed = time.time() - start_time
+
+            if self.args.method == "DisDKD":
+                # Use the advanced metrics (from your team's update)
+                disc_acc = train_losses.get("disc_accuracy", 0) * 100
+                fool_rate = train_losses.get("fool_rate", 0) * 100
+                dkd_loss = train_losses.get("dkd", 0)
+                disc_loss = train_losses.get("discriminator", 0)
+                adv_loss = train_losses.get("adversarial", 0)
+                print(
                         f"Epoch {epoch}: Train {train_acc:.2f}%, Val {val_acc:.2f}% | "
                         f"Disc_Acc: {disc_acc:.1f}%, Fool: {fool_rate:.1f}% | "
                         f"DKD: {dkd_loss:.4f}, Disc: {disc_loss:.4f}, Adv: {adv_loss:.4f} | "
                         f"Time: {elapsed:.1f}s"
                     )
-                else:
-                    # Use your stage_name logging (for FitNet/others)
-                    print(
+            else:
+                # Use your stage_name logging (for FitNet/others)
+                print(
                         f"Epoch {epoch} [{stage_name}]: Train {train_acc:.2f}%, Val {val_acc:.2f}%, Time {elapsed:.1f}s"
                     )
 
-                # Save best model
-                if val_acc > best_acc:
-                    best_acc = val_acc
-                    save_checkpoint(
+            # Save best model
+            if val_acc > best_acc:
+                best_acc = val_acc
+                save_checkpoint(
                         self.model,
                         self.student_optimizer,
                         epoch,
@@ -197,9 +198,9 @@ class Trainer:
                         is_best=True,
                     )
 
-                print("-" * 80)
+            print("-" * 80)
 
-            return best_acc
+        return best_acc
 
     def _train_epoch_standard(self, train_loader, epoch):
         """Train for one epoch (standard methods)."""
@@ -331,42 +332,88 @@ class Trainer:
         progress_bar.close()
         return self._get_average_losses(meters)
 
+
     def _validate(self, val_loader, epoch=None):
         """Validate the model."""
         self.model.eval()
 
-        losses = AverageMeter()
-        top1 = AverageMeter()
+        meters = self._init_meters(
+            adversarial=False
+        )  # includes method meter for CRD :contentReference[oaicite:8]{index=8}
 
         desc = f"Epoch {epoch} Val" if epoch is not None else "Validation"
         progress_bar = tqdm(val_loader, desc=desc, leave=False)
 
         with torch.no_grad():
-            for inputs, targets in progress_bar:
+            for batch in progress_bar:
+                # Support both (x,y) and (x,y,idx)
+                if len(batch) == 3:
+                    inputs, targets, indices = batch
+                    indices = indices.to(self.device)
+                else:
+                    inputs, targets = batch
+                    indices = None
+
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
 
-                # Forward pass
+                # For CRD: pass indices to the model
+                if self.args.method == "CRD" and indices is not None:
+                    self.model.set_sample_indices(indices)
+
+                # Forward (match your training signatures)
                 if self.args.method in ["DisDKD"]:
                     self.model.set_training_mode("student")
                     result = self.model(inputs, targets)
+                    teacher_logits = result.get("teacher_logits", None)
                     student_logits = result["student_logits"]
+                    method_specific_loss = result.get("method_specific_loss", None)
                 elif self.args.method in ["DKD"]:
-                    _, student_logits, _ = self.model(inputs, targets)
+                    teacher_logits, student_logits, method_specific_loss = self.model(
+                        inputs, targets
+                    )
                 else:
-                    _, student_logits, _ = self.model(inputs)
+                    teacher_logits, student_logits, method_specific_loss = self.model(
+                        inputs
+                    )
 
-                loss = self.criterion(student_logits, targets)
-                acc1 = accuracy(student_logits, targets, topk=(1,))[0]
+                # Compute loss components exactly like training
+                ce_loss = self.criterion(student_logits, targets)
+                kd_loss = self._compute_kd_loss(teacher_logits, student_logits)
 
-                losses.update(loss.item(), inputs.size(0))
-                top1.update(acc1.item(), inputs.size(0))
+                total = self.args.alpha * ce_loss + self.args.beta * kd_loss
+
+                losses_dict = {
+                    "ce": ce_loss.item(),
+                    "kd": kd_loss.item(),
+                }
+
+                # Method-specific (CRD/FitNet)
+                if method_specific_loss is not None and self.args.method in [
+                    "CRD",
+                    "FitNet",
+                ]:
+                    total = total + self.args.gamma * method_specific_loss
+                    if self.args.method == "CRD":
+                        losses_dict["contrastive"] = method_specific_loss.item()
+                    elif self.args.method == "FitNet":
+                        losses_dict["hint"] = method_specific_loss.item()
+
+                losses_dict["total"] = total.item()
+
+                # Update meters
+                self._update_meters(
+                    meters, losses_dict, student_logits, targets, inputs.size(0)
+                )
 
                 progress_bar.set_postfix(
-                    {"val_loss": f"{losses.avg:.4f}", "val_acc": f"{top1.avg:.2f}%"}
+                    {
+                        "val_loss": f"{meters['total'].avg:.4f}",
+                        "val_acc": f"{meters['accuracy'].avg:.2f}%",
+                    }
                 )
 
         progress_bar.close()
-        return {"total": losses.avg}, top1.avg
+        return self._get_average_losses(meters), meters["accuracy"].avg
 
     def _compute_kd_loss(self, teacher_logits, student_logits):
         """Compute knowledge distillation loss."""

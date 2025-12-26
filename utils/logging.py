@@ -3,55 +3,57 @@ from pathlib import Path
 
 
 class LossTracker:
-    """Tracks and logs all training/validation losses and metrics."""
-
     def __init__(self, log_path: str, method: str):
         self.log_path = Path(log_path)
         self.method = method
-        self.log_data = []
 
-        # Initialize CSV with headers
-        headers = ["epoch", "phase", "total_loss", "ce_loss", "kd_loss", "accuracy"]
+        self.headers = ["epoch", "phase", "total", "ce", "kd", "accuracy"]
 
-        # Add method-specific loss columns
         method_headers = {
-            "FitNet": ["hint_loss"],
-            "CRD": ["contrastive_loss"],
-            "DKD": ["tckd_loss", "nckd_loss"],
+            "FitNet": ["hint"],
+            "CRD": ["contrastive"],
+            "DKD": ["tckd", "nckd"],
             "DisDKD": [
-                "dkd_loss",
-                "discriminator_loss",
-                "adversarial_loss",
+                "dkd",
+                "discriminator",
+                "adversarial",
                 "disc_accuracy",
                 "fool_rate",
             ],
         }
-
         if method in method_headers:
-            headers.extend(method_headers[method])
+            self.headers.extend(method_headers[method])
 
-        self.headers = headers
+        # Optional but highly recommended:
+        self.headers.append("lr")
+
         self._write_headers()
 
     def _write_headers(self):
-        """Write CSV headers."""
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.log_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(self.headers)
+            csv.writer(f).writerow(self.headers)
 
-    def log_epoch(self, epoch: int, phase: str, losses: dict, accuracy: float):
-        """Log losses and metrics for an epoch."""
+    @staticmethod
+    def _to_float(x):
+        try:
+            # handles torch scalars too
+            return float(x)
+        except Exception:
+            return 0.0
+
+    def log_epoch(
+        self, epoch: int, phase: str, losses: dict, accuracy: float, lr: float = 0.0
+    ):
         row = [
             epoch,
             phase,
-            losses.get("total", 0),
-            losses.get("ce", 0),
-            losses.get("kd", 0),
-            accuracy,
+            self._to_float(losses.get("total", 0.0)),
+            self._to_float(losses.get("ce", 0.0)),
+            self._to_float(losses.get("kd", 0.0)),
+            self._to_float(accuracy),
         ]
 
-        # Add method-specific losses
         method_losses = {
             "FitNet": ["hint"],
             "CRD": ["contrastive"],
@@ -64,12 +66,10 @@ class LossTracker:
                 "fool_rate",
             ],
         }
+        for k in method_losses.get(self.method, []):
+            row.append(self._to_float(losses.get(k, 0.0)))
 
-        if self.method in method_losses:
-            for loss_key in method_losses[self.method]:
-                row.append(losses.get(loss_key, 0))
+        row.append(self._to_float(lr))
 
-        # Append to CSV
         with open(self.log_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(row)
+            csv.writer(f).writerow(row)

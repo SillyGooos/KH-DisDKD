@@ -6,7 +6,7 @@ import requests
 import torchvision
 import torchvision.transforms as transforms
 import deeplake
-
+import random
 from torch.utils.data import DataLoader, Dataset, ConcatDataset
 from tqdm import tqdm
 from PIL import Image
@@ -555,7 +555,7 @@ def get_dataloaders(dataset="CIFAR100", batch_size=64, root="./data", jitter=Fal
     """
     train_set, test_set, num_classes = get_dataset(
         dataset, root, True, jitter, train_domains, val_domains, classic_split, test_size)
-    
+
     train_loader = DataLoader(
         train_set, 
         batch_size=batch_size, 
@@ -564,7 +564,7 @@ def get_dataloaders(dataset="CIFAR100", batch_size=64, root="./data", jitter=Fal
         pin_memory=True,
         worker_init_fn=lambda worker_id: np.random.seed(42 + worker_id)
     )
-    
+
     test_loader = DataLoader(
         test_set, 
         batch_size=batch_size, 
@@ -572,54 +572,90 @@ def get_dataloaders(dataset="CIFAR100", batch_size=64, root="./data", jitter=Fal
         num_workers=num_workers, 
         pin_memory=True
     )
-    
+
     return train_loader, test_loader, num_classes
 
 
-class CRDDataset:
-    """
-    Wrapper to add sample indices to dataset for CRD.
-    """
-    def __init__(self, dataset):
-        self.dataset = dataset
-        
+class CRDTrainWrapper(Dataset):
+    """Wraps ONLY the train dataset to also return a stable sample index for CRD."""
+
+    def __init__(self, base_ds):
+        self.base = base_ds
+
     def __len__(self):
-        return len(self.dataset)
-    
-    def __getitem__(self, idx):
-        data, target = self.dataset[idx]
-        return data, target, idx
+        return len(self.base)
+
+    def __getitem__(self, i):
+        x, y = self.base[i]
+        return x, y, i  # IMPORTANT: index in train dataset order
 
 
-def get_crd_dataloaders(dataset="CIFAR100", batch_size=64, root="./data", jitter=False, 
-                       num_workers=4, train_domains=None, val_domains=None,
-                       classic_split=False, test_size=0.2):
+def seed_worker(worker_id: int):
+    # Fully correct deterministic seeding for dataloader workers
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def get_crd_dataloaders(
+    dataset,
+    batch_size,
+    data_root,
+    jitter,
+    num_workers,
+    train_domains=None,
+    val_domains=None,
+    classic_split=False,
+    test_size=0.2,
+    seed=0,
+):
     """
-    Get data loaders for CRD method with sample indices.
+    Returns:
+      train_loader: yields (x, y, idx)  <-- ONLY here
+      val_loader: yields (x, y)
+      num_classes
     """
-    train_set, test_set, num_classes = get_dataset(
-        dataset, root, True, jitter, train_domains, val_domains, classic_split, test_size)
-    
-    train_set = CRDDataset(train_set)
-    
+    # 1) Build your underlying train_set / test_set the SAME way as get_dataloaders does
+    train_set, val_set, num_classes = get_dataset(name=dataset,root=data_root,
+    download=True,
+    jitter=jitter,
+    train_domains=train_domains,
+    val_domains=val_domains,
+    classic_split=classic_split,
+    test_size=test_size,
+    )
+
+
+    # 2) Wrap ONLY train_set
+    train_set = CRDTrainWrapper(train_set)
+
+    # 3) Deterministic generator for shuffle
+    g = torch.Generator()
+    g.manual_seed(seed)
+
     train_loader = DataLoader(
-        train_set, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=num_workers, 
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
         pin_memory=True,
-        worker_init_fn=lambda worker_id: np.random.seed(42 + worker_id)
+        drop_last=True,  # strongly recommended for CRD stability
+        worker_init_fn=seed_worker,
+        generator=g,
     )
-    
-    test_loader = DataLoader(
-        test_set, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        num_workers=num_workers, 
-        pin_memory=True
+
+    val_loader = DataLoader(
+        val_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+        worker_init_fn=seed_worker,
+        generator=g,
     )
-    
-    return train_loader, test_loader, num_classes
+
+    return train_loader, val_loader, num_classes
 
 
 def print_dataset_info(dataset_name: str, train_domains: list = None, val_domains: list = None, 

@@ -1,4 +1,3 @@
-from distill import *
 import torch.nn as nn
 from pretraining import Pretraining
 from distill.DisDKD import DisDKD
@@ -6,7 +5,6 @@ from distill.fitnet import FitNet
 from distill.dkd import DKD
 from distill.logits_kd import LogitKD
 from distill.crd import CRD
-from distill.DisDKD import DisDKD
 from utils.utils import count_params
 
 
@@ -27,23 +25,47 @@ def create_distillation_model(args, teacher, student, num_classes: int):
     """Create the appropriate distillation model."""
     teacher_channels = get_layer_channels(args.teacher, args.teacher_layer)
     student_channels = get_layer_channels(args.student, args.student_layer)
-    
+
     models = {
-        'Pretraining': lambda: Pretraining(teacher),
-        'LogitKD': lambda: LogitKD(teacher, student),
-        'DKD': lambda: DKD(teacher, student, args.dkd_alpha, args.dkd_beta, args.tau),
-        'DisDKD': lambda: DisDKD(teacher, student, args.teacher_layer,
-                                 args.student_layer, teacher_channels,
-                                 student_channels, args.hidden_channels,
-                                 args.dkd_alpha, args.dkd_beta, args.tau),
-        'FitNet': lambda: FitNet(teacher, student, args.teacher_layer, 
-                                args.student_layer, teacher_channels, 
-                                student_channels, args.adapter),
-        'CRD': lambda: CRD(teacher, student, args.teacher_layer, 
-                          args.student_layer, teacher_channels, 
-                          student_channels, len(args._train_dataset), args.feat_dim),
+        "Pretraining": lambda: Pretraining(teacher),
+        "LogitKD": lambda: LogitKD(teacher, student),
+        "DKD": lambda: DKD(teacher, student, args.dkd_alpha, args.dkd_beta, args.tau),
+        "DisDKD": lambda: DisDKD(
+            teacher,
+            student,
+            args.teacher_layer,
+            args.student_layer,
+            teacher_channels,
+            student_channels,
+            args.hidden_channels,
+            args.dkd_alpha,
+            args.dkd_beta,
+            args.tau,
+        ),
+        "FitNet": lambda: FitNet(
+            teacher,
+            student,
+            args.teacher_layer,
+            args.student_layer,
+            teacher_channels,
+            student_channels,
+            args.adapter,
+        ),
+        "CRD": lambda: CRD(
+            teacher,
+            student,
+            args.teacher_layer,
+            args.student_layer,
+            teacher_channels,
+            student_channels,
+            len(args._train_dataset),
+            feat_dim=args.feat_dim,
+            temperature=args.crd_temperature,
+            momentum=args.crd_momentum,
+            n_negatives=args.crd_n_negatives,
+        ),
     }
-    
+
     return models[args.method]()
 
 
