@@ -62,7 +62,7 @@ def create_distillation_model(args, teacher, student, num_classes: int):
             feat_dim=args.feat_dim,
             temperature=args.crd_temperature,
             momentum=args.crd_momentum,
-            n_data==args.crd_n_negatives,
+            n_data=args.crd_n_negatives,
         ),
     }
 
