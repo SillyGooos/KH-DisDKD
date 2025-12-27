@@ -291,20 +291,8 @@ class Trainer:
 
             # For DisDKD, also add the DKD loss
             if self.args.method == "DisDKD":
-                dkd_loss = student_result.get("method_specific_loss", 0)
-                if isinstance(dkd_loss, torch.Tensor):
-                    total_loss = (
-                        weighted_ce
-                        + weighted_kd
-                        + self.args.disdkd_adversarial_weight * student_loss
-                        + dkd_loss
-                    )
-                else:
-                    total_loss = (
-                        weighted_ce
-                        + weighted_kd
-                        + self.args.disdkd_adversarial_weight * student_loss
-                    )
+                kd_val = student_result.get("method_specific_loss", 0)
+                total_loss = weighted_ce + (self.args.beta * kd_val) + (self.args.gamma * student_loss)
             else:
                 total_loss = weighted_ce + weighted_kd + self.args.gamma * student_loss
 
@@ -541,7 +529,7 @@ class Trainer:
                 }
             )
             if self.args.method == "DisDKD":
-                meters["dkd"] = AverageMeter()
+                meters["kd"] = AverageMeter()
         else:
             # Method-specific meters
             method_meters = {
