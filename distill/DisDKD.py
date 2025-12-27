@@ -104,13 +104,6 @@ import torch.nn.functional as F
 # ... (Keep FeatureHooks, FeatureRegressor, FeatureDiscriminator as they are)
 
 class DisDKD(nn.Module):
-    """
-    Discriminator-enhanced Logit Knowledge Distillation.
-    
-    Combines standard KL-Divergence logit matching with 
-    discriminator-based feature alignment.
-    """
-
     def __init__(
         self,
         teacher,
@@ -120,8 +113,8 @@ class DisDKD(nn.Module):
         teacher_channels,
         student_channels,
         hidden_channels=256,
-        alpha=1.0, # Weight for CE
-        beta=1.0,  # Weight for KL Logit KD
+        alpha=1.0, 
+        beta=1.0,  
         temperature=4.0,
     ):
         super(DisDKD, self).__init__()
@@ -132,37 +125,58 @@ class DisDKD(nn.Module):
         self.beta = beta
         self.temperature = temperature
 
-        # Freeze teacher
         for param in self.teacher.parameters():
             param.requires_grad = False
 
-        # Hooks
         self.teacher_hooks = FeatureHooks([(teacher_layer, get_module(self.teacher.model, teacher_layer))])
         self.student_hooks = FeatureHooks([(student_layer, get_module(self.student.model, student_layer))])
         self.teacher_layer = teacher_layer
         self.student_layer = student_layer
 
-        # Regressors and Discriminator
         self.teacher_regressor = FeatureRegressor(teacher_channels, hidden_channels)
         self.student_regressor = FeatureRegressor(student_channels, hidden_channels)
         self.discriminator = FeatureDiscriminator(hidden_channels)
         self.bce_loss = nn.BCELoss()
+        
+        # This MUST be managed correctly
         self.training_mode = "student"
 
     def set_training_mode(self, mode):
-        # ... (Keep same logic as DisDKD to freeze/unfreeze params)
-        pass
+        """IMPORTANT: This logic ensures the correct dictionary keys are returned."""
+        assert mode in ["student", "discriminator"]
+        self.training_mode = mode
+
+        if mode == "discriminator":
+            # Phase 1: Train discriminator and teacher projector
+            for param in self.student.parameters():
+                param.requires_grad = False
+            for param in self.student_regressor.parameters():
+                param.requires_grad = False
+            for param in self.discriminator.parameters():
+                param.requires_grad = True
+            for param in self.teacher_regressor.parameters():
+                param.requires_grad = True
+        else:
+            # Phase 2: Train student and student projector
+            for param in self.student.parameters():
+                param.requires_grad = True
+            for param in self.student_regressor.parameters():
+                param.requires_grad = True
+            for param in self.discriminator.parameters():
+                param.requires_grad = False
+            for param in self.teacher_regressor.parameters():
+                param.requires_grad = False
 
     def compute_kd_loss(self, logits_student, logits_teacher):
-        """Standard KL Divergence for Logit Matching."""
         T = self.temperature
         p_s = F.log_softmax(logits_student / T, dim=1)
         p_t = F.softmax(logits_teacher / T, dim=1)
-        # We multiply by T^2 as per original KD paper to keep gradients consistent
         return F.kl_div(p_s, p_t, reduction="batchmean") * (T * T)
 
     def forward(self, x, targets):
         batch_size = x.size(0)
+        
+        # Forward passes
         with torch.no_grad():
             teacher_logits = self.teacher(x)
         student_logits = self.student(x)
@@ -170,15 +184,18 @@ class DisDKD(nn.Module):
         teacher_feat = self.teacher_hooks.features.get(self.teacher_layer)
         student_feat = self.student_hooks.features.get(self.student_layer)
 
-        # Feature projection
+        # Projections
         teacher_hidden = self.teacher_regressor(teacher_feat)
         student_hidden = self.student_regressor(student_feat)
+        
+        # Spatial Matching
         if student_hidden.shape[2:] != teacher_hidden.shape[2:]:
             student_hidden = F.interpolate(student_hidden, size=teacher_hidden.shape[2:], mode="bilinear")
 
         result = {"teacher_logits": teacher_logits, "student_logits": student_logits}
 
         if self.training_mode == "discriminator":
+            # PHASE: DISCRIMINATOR
             teacher_pred = self.discriminator(teacher_hidden)
             student_pred = self.discriminator(student_hidden.detach())
             
@@ -188,13 +205,12 @@ class DisDKD(nn.Module):
             disc_loss = (self.bce_loss(teacher_pred, real_labels) + 
                          self.bce_loss(student_pred, fake_labels)) / 2
             
+            result["total_disc_loss"] = disc_loss # <--- Trainer is looking for this
             result["discriminator_loss"] = disc_loss.item()
             result["discriminator_accuracy"] = ((teacher_pred > 0.5).float().mean() + 
                                                (student_pred <= 0.5).float().mean()).item() / 2
-            result["total_disc_loss"] = disc_loss
-
-        else: # student mode
-            # Standard KD Loss instead of DKD
+        else:
+            # PHASE: STUDENT
             kd_loss = self.compute_kd_loss(student_logits, teacher_logits)
             
             student_pred = self.discriminator(student_hidden)
@@ -205,8 +221,16 @@ class DisDKD(nn.Module):
             result["adversarial_loss"] = adversarial_loss.item()
             result["fool_rate"] = (student_pred > 0.5).float().mean().item()
             result["total_student_loss"] = adversarial_loss
-            result["method_specific_loss"] = kd_loss # This goes to beta in Trainer
+            result["method_specific_loss"] = kd_loss 
 
         self.teacher_hooks.clear()
         self.student_hooks.clear()
         return result
+
+    def get_optimizers(self, student_lr=1e-3, discriminator_lr=1e-4, weight_decay=1e-4):
+        student_params = list(self.student.parameters()) + list(self.student_regressor.parameters())
+        discriminator_params = list(self.discriminator.parameters()) + list(self.teacher_regressor.parameters())
+
+        opt_s = torch.optim.Adam(student_params, lr=student_lr, weight_decay=weight_decay)
+        opt_d = torch.optim.Adam(discriminator_params, lr=discriminator_lr, weight_decay=weight_decay)
+        return opt_s, opt_d

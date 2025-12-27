@@ -379,7 +379,7 @@ class Trainer:
                 # Method-specific (CRD/FitNet)
                 if method_specific_loss is not None and self.args.method in [
                     "CRD",
-                    "FitNet",
+                    "FitNet"
                 ]:
                     total = total + self.args.gamma * method_specific_loss
                     if self.args.method == "CRD":
@@ -589,7 +589,7 @@ class Trainer:
         meters["fool_rate"].update(student_result.get("fool_rate", 0), batch_size)
 
         if self.args.method == "DisDKD":
-            dkd_value = student_result.get("dkd_loss", 0)
+            dkd_value = student_result.get("kd_loss", 0)
             if isinstance(dkd_value, torch.Tensor):
                 dkd_value = dkd_value.item()
             meters["dkd"].update(dkd_value, batch_size)
