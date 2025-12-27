@@ -592,7 +592,7 @@ class Trainer:
             dkd_value = student_result.get("kd_loss", 0)
             if isinstance(dkd_value, torch.Tensor):
                 dkd_value = dkd_value.item()
-            meters["dkd"].update(dkd_value, batch_size)
+            meters["kd"].update(dkd_value, batch_size)
 
     def _update_progress_bar(self, progress_bar, meters):
         """Update progress bar with current metrics."""
@@ -623,8 +623,8 @@ class Trainer:
         }
 
         # Add method-specific metrics
-        if self.args.method == "DisDKD" and "dkd" in meters:
-            postfix["dkd"] = f'{meters["dkd"].avg:.4f}'
+        if self.args.method == "DisDKD" and "kd" in meters:
+            postfix["kd"] = f'{meters["kd"].avg:.4f}'
 
         progress_bar.set_postfix(postfix)
 
