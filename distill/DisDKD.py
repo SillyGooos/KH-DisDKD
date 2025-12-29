@@ -5,10 +5,8 @@ from collections import OrderedDict
 
 from utils.utils import get_module, count_params
 
-
 class FeatureHooks:
     """Helper class to extract intermediate features from a network using forward hooks."""
-
     def __init__(self, named_layers):
         self.features = OrderedDict()
         self.hooks = []
@@ -29,7 +27,6 @@ class FeatureHooks:
             hook.remove()
         self.hooks.clear()
 
-
 class FeatureRegressor(nn.Module):
     """1x1 conv regressor to project features to a common hidden dimension."""
     def __init__(self, in_channels, hidden_channels):
@@ -41,14 +38,11 @@ class FeatureRegressor(nn.Module):
     def forward(self, x):
         return self.regressor(x)
 
-
 class DisDKD(nn.Module):
     """
-    FitNet-style DKD:
-    - DKD logit distillation (TCKD + NCKD)
-    - Intermediate feature regression (MSE) from teacher -> student
+    Modified DisDKD: Now performs FitNet-style MSE + DKD.
+    Includes dummy attributes to maintain compatibility with adversarial Trainer logic.
     """
-
     def __init__(
         self,
         teacher,
@@ -61,7 +55,7 @@ class DisDKD(nn.Module):
         alpha=1.0,
         beta=8.0,
         temperature=4.0,
-        lambda_feat=1.0,  # Weight for feature regression loss
+        lambda_feat=1.0,
     ):
         super().__init__()
         self.teacher = teacher
@@ -72,7 +66,12 @@ class DisDKD(nn.Module):
         self.temperature = temperature
         self.lambda_feat = lambda_feat
 
-        # Freeze teacher parameters
+        # --- MANDATORY DUMMY FOR TRAINER ---
+        # Trainer looks for 'model.discriminator'. We provide a dummy to prevent NoneType error.
+        self.discriminator = nn.Parameter(torch.tensor([0.0])) 
+        self.training_mode = "student" 
+
+        # Freeze teacher
         for param in self.teacher.parameters():
             param.requires_grad = False
 
@@ -88,53 +87,11 @@ class DisDKD(nn.Module):
         self.teacher_regressor = FeatureRegressor(teacher_channels, hidden_channels)
         self.student_regressor = FeatureRegressor(student_channels, hidden_channels)
 
-        # Feature loss
         self.mse_loss = nn.MSELoss()
 
-        print(f"Teacher regressor params: {count_params(self.teacher_regressor)*1e-6:.3f}M")
-        print(f"Student regressor params: {count_params(self.student_regressor)*1e-6:.3f}M")
-        print(f"DKD params: alpha={alpha}, beta={beta}, temperature={temperature}")
-        print(f"Feature regression weight: lambda_feat={lambda_feat}")
-
     def set_training_mode(self, mode):
-        """
-        Dummy method to maintain compatibility with Trainer.
-        For FitNet/MSE, there's no discriminator phase.
-        """
-        # Only 'student' mode exists now
-        if mode != "student":
-            print(f"Ignoring training mode {mode}, using student mode only.")
-
-    def compute_dkd_loss(self, logits_student, logits_teacher, target):
-        """Decoupled Knowledge Distillation loss (TCKD + NCKD)."""
-        gt_mask = self._get_gt_mask(logits_student, target)
-        other_mask = self._get_other_mask(logits_student, target)
-
-        pred_student = F.softmax(logits_student / self.temperature, dim=1)
-        pred_teacher = F.softmax(logits_teacher / self.temperature, dim=1)
-
-        # TCKD
-        pred_student_tckd = self._cat_mask(pred_student, gt_mask, other_mask)
-        pred_teacher_tckd = self._cat_mask(pred_teacher, gt_mask, other_mask)
-        log_pred_student_tckd = torch.log(pred_student_tckd)
-        tckd_loss = (
-            F.kl_div(log_pred_student_tckd, pred_teacher_tckd, reduction="batchmean")
-            * (self.temperature**2)
-        )
-
-        # NCKD
-        pred_teacher_nckd = F.softmax(
-            logits_teacher / self.temperature - 1000.0 * gt_mask, dim=1
-        )
-        log_pred_student_nckd = F.log_softmax(
-            logits_student / self.temperature - 1000.0 * gt_mask, dim=1
-        )
-        nckd_loss = (
-            F.kl_div(log_pred_student_nckd, pred_teacher_nckd, reduction="batchmean")
-            * (self.temperature**2)
-        )
-
-        return self.alpha * tckd_loss + self.beta * nckd_loss
+        """Sets the internal mode to handle the Trainer's two-step call."""
+        self.training_mode = mode
 
     def _get_gt_mask(self, logits, target):
         target = target.reshape(-1)
@@ -151,44 +108,61 @@ class DisDKD(nn.Module):
         t2 = (t * mask2).sum(1, keepdims=True)
         return torch.cat([t1, t2], dim=1)
 
+    def compute_dkd_loss(self, logits_student, logits_teacher, target):
+        gt_mask = self._get_gt_mask(logits_student, target)
+        other_mask = self._get_other_mask(logits_student, target)
+
+        pred_student = F.softmax(logits_student / self.temperature, dim=1)
+        pred_teacher = F.softmax(logits_teacher / self.temperature, dim=1)
+
+        pred_student_tckd = self._cat_mask(pred_student, gt_mask, other_mask)
+        pred_teacher_tckd = self._cat_mask(pred_teacher, gt_mask, other_mask)
+        
+        tckd_loss = F.kl_div(torch.log(pred_student_tckd + 1e-7), pred_teacher_tckd, reduction="batchmean") * (self.temperature**2)
+
+        pred_teacher_nckd = F.softmax(logits_teacher / self.temperature - 1000.0 * gt_mask, dim=1)
+        log_pred_student_nckd = F.log_softmax(logits_student / self.temperature - 1000.0 * gt_mask, dim=1)
+        
+        nckd_loss = F.kl_div(log_pred_student_nckd, pred_teacher_nckd, reduction="batchmean") * (self.temperature**2)
+
+        return self.alpha * tckd_loss + self.beta * nckd_loss
+
     def forward(self, x, targets):
-        # Teacher and student logits
+        # 1. Handle Discriminator phase (Dummy)
+        if self.training_mode == "discriminator":
+            return {
+                "total_disc_loss": self.discriminator * 0, # zero grad flow
+                "discriminator_loss": 0.0,
+                "discriminator_accuracy": 1.0 
+            }
+
+        # 2. Handle Student phase (Actual MSE + DKD)
         with torch.no_grad():
             teacher_logits = self.teacher(x)
         student_logits = self.student(x)
 
-        # Intermediate features
         teacher_feat = self.teacher_hooks.features.get(list(self.teacher_hooks.features.keys())[0])
         student_feat = self.student_hooks.features.get(list(self.student_hooks.features.keys())[0])
 
-        if teacher_feat is None or student_feat is None:
-            raise ValueError("Missing features from hooks!")
-
-        # Project to hidden space
+        # Project and calc MSE
         teacher_hidden = self.teacher_regressor(teacher_feat)
         student_hidden = self.student_regressor(student_feat)
-
-        # Feature regression loss
         feat_loss = self.mse_loss(student_hidden, teacher_hidden)
 
-        # DKD loss
+        # Logit matching
         dkd_loss = self.compute_dkd_loss(student_logits, teacher_logits, targets)
 
-        total_loss = dkd_loss + self.lambda_feat * feat_loss
-
-        # Clear hooks
+        # Clear hooks for next iteration
         self.teacher_hooks.clear()
         self.student_hooks.clear()
 
+        # training.py expects these specific keys in adversarial mode
         return {
-            "teacher_logits": teacher_logits,
             "student_logits": student_logits,
-            "dkd_loss": dkd_loss.item(),
-            "feat_loss": feat_loss.item(),
-            "total_loss": total_loss
+            "teacher_logits": teacher_logits,
+            "total_student_loss": feat_loss * self.lambda_feat, # Maps to 'adversarial_loss' in trainer
+            "kd_loss": dkd_loss,                              # Maps to logit matching
+            "method_specific_loss": dkd_loss,                  # For meter logging
+            "adversarial_loss": feat_loss.item(),
+            "fool_rate": 0.0
         }
-
-    def get_optimizer(self, lr=1e-3, weight_decay=1e-4):
-        """Single optimizer for student + regressor."""
-        params = list(self.student.parameters()) + list(self.student_regressor.parameters())
-        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
