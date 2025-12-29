@@ -37,6 +37,12 @@ class FeatureRegressor(nn.Module):
 
     def forward(self, x):
         return self.regressor(x)
+    
+class DummyDiscriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dummy_param = nn.Parameter(torch.tensor([0.0]))
+    def forward(self, x): return x
 
 class DisDKD(nn.Module):
     """
@@ -68,7 +74,7 @@ class DisDKD(nn.Module):
 
         # --- MANDATORY DUMMY FOR TRAINER ---
         # Trainer looks for 'model.discriminator'. We provide a dummy to prevent NoneType error.
-        self.discriminator = nn.Parameter(torch.tensor([0.0])) 
+        self.discriminator = DummyDiscriminator()
         self.training_mode = "student" 
 
         # Freeze teacher
