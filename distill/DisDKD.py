@@ -96,6 +96,15 @@ class DisDKD(nn.Module):
         print(f"DKD params: alpha={alpha}, beta={beta}, temperature={temperature}")
         print(f"Feature regression weight: lambda_feat={lambda_feat}")
 
+    def set_training_mode(self, mode):
+        """
+        Dummy method to maintain compatibility with Trainer.
+        For FitNet/MSE, there's no discriminator phase.
+        """
+        # Only 'student' mode exists now
+        if mode != "student":
+            print(f"Ignoring training mode {mode}, using student mode only.")
+
     def compute_dkd_loss(self, logits_student, logits_teacher, target):
         """Decoupled Knowledge Distillation loss (TCKD + NCKD)."""
         gt_mask = self._get_gt_mask(logits_student, target)
