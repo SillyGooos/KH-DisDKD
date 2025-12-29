@@ -136,8 +136,12 @@ class DisDKD(nn.Module):
     def forward(self, x, targets):
         # 1. Handle Discriminator phase (Dummy)
         if self.training_mode == "discriminator":
+            # Access the dummy parameter directly to provide a differentiable 0.0
+            # This ensures the optimizer has a 'loss' to step on without changing weights.
+            dummy_loss = self.discriminator.dummy_param * 0 
+            
             return {
-                "total_disc_loss": self.discriminator * 0, # zero grad flow
+                "total_disc_loss": dummy_loss, 
                 "discriminator_loss": 0.0,
                 "discriminator_accuracy": 1.0 
             }
@@ -145,30 +149,35 @@ class DisDKD(nn.Module):
         # 2. Handle Student phase (Actual MSE + DKD)
         with torch.no_grad():
             teacher_logits = self.teacher(x)
+        
         student_logits = self.student(x)
 
+        # Retrieve feature maps from the hooks
         teacher_feat = self.teacher_hooks.features.get(list(self.teacher_hooks.features.keys())[0])
         student_feat = self.student_hooks.features.get(list(self.student_hooks.features.keys())[0])
 
-        # Project and calc MSE
+        # --- MSE FEATURE ALIGNMENT ---
+        # 1x1 convolutions project student/teacher to the same hidden dimension
         teacher_hidden = self.teacher_regressor(teacher_feat)
         student_hidden = self.student_regressor(student_feat)
+        
+        # This is the "Hint" or "FitNet" loss
         feat_loss = self.mse_loss(student_hidden, teacher_hidden)
 
-        # Logit matching
+        # --- DKD LOGIT DISTILLATION ---
         dkd_loss = self.compute_dkd_loss(student_logits, teacher_logits, targets)
 
-        # Clear hooks for next iteration
+        # Clean up hooks
         self.teacher_hooks.clear()
         self.student_hooks.clear()
 
-        # training.py expects these specific keys in adversarial mode
         return {
             "student_logits": student_logits,
             "teacher_logits": teacher_logits,
-            "total_student_loss": feat_loss * self.lambda_feat, # Maps to 'adversarial_loss' in trainer
-            "kd_loss": dkd_loss,                              # Maps to logit matching
-            "method_specific_loss": dkd_loss,                  # For meter logging
-            "adversarial_loss": feat_loss.item(),
+            # We pass the MSE loss here as the 'adversarial' component
+            "total_student_loss": feat_loss * self.lambda_feat, 
+            "kd_loss": dkd_loss,
+            "method_specific_loss": dkd_loss,
+            "adversarial_loss": feat_loss.item(), # This will show up in logs as MSE
             "fool_rate": 0.0
         }
