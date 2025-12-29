@@ -7,7 +7,8 @@ from utils.utils import get_module, count_params
 
 
 class FeatureHooks:
-    """Helper class to extract intermediate features using forward hooks."""
+    """Helper class to extract intermediate features from a network using forward hooks."""
+
     def __init__(self, named_layers):
         self.features = OrderedDict()
         self.hooks = []
@@ -30,9 +31,9 @@ class FeatureHooks:
 
 
 class FeatureRegressor(nn.Module):
-    """1x1 convolutional regressor to project features to a common dimension."""
+    """1x1 conv regressor to project features to a common hidden dimension."""
     def __init__(self, in_channels, hidden_channels):
-        super(FeatureRegressor, self).__init__()
+        super().__init__()
         self.regressor = nn.Conv2d(
             in_channels, hidden_channels, kernel_size=1, stride=1, padding=0, bias=False
         )
@@ -41,34 +42,11 @@ class FeatureRegressor(nn.Module):
         return self.regressor(x)
 
 
-class FeatureDiscriminator(nn.Module):
-    """Discriminator to distinguish between teacher and student features."""
-    def __init__(self, hidden_channels):
-        super(FeatureDiscriminator, self).__init__()
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
-        self.discriminator = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(hidden_channels, hidden_channels // 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_channels // 2, hidden_channels // 4),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_channels // 4, 1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x):
-        pooled = self.global_pool(x)
-        return self.discriminator(pooled)
-
-
 class DisDKD(nn.Module):
     """
-    Discriminator-enhanced Knowledge Distillation (Logit Matching version).
-    
-    NOTE: Name is kept as DisDKD for compatibility, but logic uses 
-    Standard KL Divergence for logits instead of Decoupled KD.
+    FitNet-style DKD:
+    - DKD logit distillation (TCKD + NCKD)
+    - Intermediate feature regression (MSE) from teacher -> student
     """
 
     def __init__(
@@ -81,22 +59,24 @@ class DisDKD(nn.Module):
         student_channels,
         hidden_channels=256,
         alpha=1.0,
-        beta=1.0, # Usually beta is lower for standard KD compared to DKD
+        beta=8.0,
         temperature=4.0,
+        lambda_feat=1.0,  # Weight for feature regression loss
     ):
-        super(DisDKD, self).__init__()
+        super().__init__()
         self.teacher = teacher
         self.student = student
         self.hidden_channels = hidden_channels
         self.alpha = alpha
         self.beta = beta
         self.temperature = temperature
+        self.lambda_feat = lambda_feat
 
-        # Freeze teacher
+        # Freeze teacher parameters
         for param in self.teacher.parameters():
             param.requires_grad = False
 
-        # Set up hooks
+        # Feature hooks
         self.teacher_hooks = FeatureHooks(
             [(teacher_layer, get_module(self.teacher.model, teacher_layer))]
         )
@@ -104,87 +84,102 @@ class DisDKD(nn.Module):
             [(student_layer, get_module(self.student.model, student_layer))]
         )
 
-        self.teacher_layer = teacher_layer
-        self.student_layer = student_layer
-
-        # Projectors and Discriminator
+        # Regressors
         self.teacher_regressor = FeatureRegressor(teacher_channels, hidden_channels)
         self.student_regressor = FeatureRegressor(student_channels, hidden_channels)
-        self.discriminator = FeatureDiscriminator(hidden_channels)
-        
-        self.bce_loss = nn.BCELoss()
-        self.kd_criterion = nn.KLDivLoss(reduction="batchmean")
-        self.training_mode = "student"
 
-    def set_training_mode(self, mode):
-        assert mode in ["student", "discriminator"]
-        self.training_mode = mode
-        
-        # Toggle gradients
-        is_disc = (mode == "discriminator")
-        for param in self.student.parameters(): param.requires_grad = not is_disc
-        for param in self.student_regressor.parameters(): param.requires_grad = not is_disc
-        for param in self.discriminator.parameters(): param.requires_grad = is_disc
-        for param in self.teacher_regressor.parameters(): param.requires_grad = is_disc
+        # Feature loss
+        self.mse_loss = nn.MSELoss()
 
-    def compute_logit_kd_loss(self, logits_student, logits_teacher):
-        """
-        Standard Logit Matching using KL Divergence.
-        Replaces the Decoupled KD (TCKD/NCKD) logic.
-        """
-        T = self.temperature
-        soft_targets = F.softmax(logits_teacher / T, dim=1)
-        log_probs = F.log_softmax(logits_student / T, dim=1)
-        
-        # Return KL Divergence scaled by T^2
-        return self.kd_criterion(log_probs, soft_targets) * (T * T)
+        print(f"Teacher regressor params: {count_params(self.teacher_regressor)*1e-6:.3f}M")
+        print(f"Student regressor params: {count_params(self.student_regressor)*1e-6:.3f}M")
+        print(f"DKD params: alpha={alpha}, beta={beta}, temperature={temperature}")
+        print(f"Feature regression weight: lambda_feat={lambda_feat}")
+
+    def compute_dkd_loss(self, logits_student, logits_teacher, target):
+        """Decoupled Knowledge Distillation loss (TCKD + NCKD)."""
+        gt_mask = self._get_gt_mask(logits_student, target)
+        other_mask = self._get_other_mask(logits_student, target)
+
+        pred_student = F.softmax(logits_student / self.temperature, dim=1)
+        pred_teacher = F.softmax(logits_teacher / self.temperature, dim=1)
+
+        # TCKD
+        pred_student_tckd = self._cat_mask(pred_student, gt_mask, other_mask)
+        pred_teacher_tckd = self._cat_mask(pred_teacher, gt_mask, other_mask)
+        log_pred_student_tckd = torch.log(pred_student_tckd)
+        tckd_loss = (
+            F.kl_div(log_pred_student_tckd, pred_teacher_tckd, reduction="batchmean")
+            * (self.temperature**2)
+        )
+
+        # NCKD
+        pred_teacher_nckd = F.softmax(
+            logits_teacher / self.temperature - 1000.0 * gt_mask, dim=1
+        )
+        log_pred_student_nckd = F.log_softmax(
+            logits_student / self.temperature - 1000.0 * gt_mask, dim=1
+        )
+        nckd_loss = (
+            F.kl_div(log_pred_student_nckd, pred_teacher_nckd, reduction="batchmean")
+            * (self.temperature**2)
+        )
+
+        return self.alpha * tckd_loss + self.beta * nckd_loss
+
+    def _get_gt_mask(self, logits, target):
+        target = target.reshape(-1)
+        mask = torch.zeros_like(logits).scatter_(1, target.unsqueeze(1), 1).bool()
+        return mask
+
+    def _get_other_mask(self, logits, target):
+        target = target.reshape(-1)
+        mask = torch.ones_like(logits).scatter_(1, target.unsqueeze(1), 0).bool()
+        return mask
+
+    def _cat_mask(self, t, mask1, mask2):
+        t1 = (t * mask1).sum(dim=1, keepdims=True)
+        t2 = (t * mask2).sum(1, keepdims=True)
+        return torch.cat([t1, t2], dim=1)
 
     def forward(self, x, targets):
-        batch_size = x.size(0)
-
+        # Teacher and student logits
         with torch.no_grad():
             teacher_logits = self.teacher(x)
         student_logits = self.student(x)
 
-        teacher_feat = self.teacher_hooks.features.get(self.teacher_layer)
-        student_feat = self.student_hooks.features.get(self.student_layer)
+        # Intermediate features
+        teacher_feat = self.teacher_hooks.features.get(list(self.teacher_hooks.features.keys())[0])
+        student_feat = self.student_hooks.features.get(list(self.student_hooks.features.keys())[0])
 
+        if teacher_feat is None or student_feat is None:
+            raise ValueError("Missing features from hooks!")
+
+        # Project to hidden space
         teacher_hidden = self.teacher_regressor(teacher_feat)
         student_hidden = self.student_regressor(student_feat)
 
-        result = {"teacher_logits": teacher_logits, "student_logits": student_logits}
+        # Feature regression loss
+        feat_loss = self.mse_loss(student_hidden, teacher_hidden)
 
-        if self.training_mode == "discriminator":
-            teacher_pred = self.discriminator(teacher_hidden.detach()) # Added detach to avoid regressor updates
-            student_pred = self.discriminator(student_hidden.detach())
+        # DKD loss
+        dkd_loss = self.compute_dkd_loss(student_logits, teacher_logits, targets)
 
-            real_labels = torch.ones(batch_size, 1, device=x.device)
-            fake_labels = torch.zeros(batch_size, 1, device=x.device)
+        total_loss = dkd_loss + self.lambda_feat * feat_loss
 
-            loss_real = self.bce_loss(teacher_pred, real_labels)
-            loss_fake = self.bce_loss(student_pred, fake_labels)
-            disc_loss = (loss_real + loss_fake) / 2
-
-            result["total_disc_loss"] = disc_loss
-            result["discriminator_loss"] = disc_loss.item()
-            result["discriminator_accuracy"] = ((teacher_pred > 0.5).float().mean() + (student_pred <= 0.5).float().mean()).item() / 2
-
-        else:
-            # PHASE 2: Student training
-            kd_loss = self.compute_logit_kd_loss(student_logits, teacher_logits)
-            
-            student_pred = self.discriminator(student_hidden)
-            real_labels = torch.ones(batch_size, 1, device=x.device)
-            adv_loss = self.bce_loss(student_pred, real_labels)
-
-            # Match these keys to training.py
-            result["kd_loss"] = kd_loss # Return tensor for backward
-            result["adversarial_loss"] = adv_loss.item()
-            result["total_student_loss"] = adv_loss
-            result["fool_rate"] = (student_pred > 0.5).float().mean().item()
-            # This is the 'method_specific_loss' used in the total_loss calculation
-            result["method_specific_loss"] = kd_loss 
-
+        # Clear hooks
         self.teacher_hooks.clear()
         self.student_hooks.clear()
-        return result
+
+        return {
+            "teacher_logits": teacher_logits,
+            "student_logits": student_logits,
+            "dkd_loss": dkd_loss.item(),
+            "feat_loss": feat_loss.item(),
+            "total_loss": total_loss
+        }
+
+    def get_optimizer(self, lr=1e-3, weight_decay=1e-4):
+        """Single optimizer for student + regressor."""
+        params = list(self.student.parameters()) + list(self.student_regressor.parameters())
+        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
